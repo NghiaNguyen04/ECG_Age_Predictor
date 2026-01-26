@@ -20,12 +20,9 @@ from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint, Learning
 from pytorch_lightning.loggers import TensorBoardLogger
 from pytorch_lightning.loggers import WandbLogger
 
-from model.InceptionTime import InceptionTimeLightning
-from model.resnet34 import ResNet1DLightning
+from model.resnet34_hybridLoss import ResNet1DLightning
 from model.resnet34_coralLoss import ResNet1D_CoralLoss
-from model.resnet34_FocalCosAge import ResNet1D_FocalCosAge
-from model.ConvTimeNet import ConvTimeNetLightning
-from model.ConvTimeNet_coralLoss import ConvTimeNetCoralLoss
+from model.resnet34_FocalCosLoss import ResNet1D_FocalCos
 
 from data_provider.datamodule import TSDataModule
 from data_provider.data_loader import AAGINGLoader
@@ -63,21 +60,7 @@ def load_dataset(args: argparse.Namespace):
     return data_ndarray
 
 def load_model(args: argparse.Namespace, class_weights, y_train_np: np.ndarray = None) -> pl.LightningModule:
-    if args.model == "InceptionTime":
-        return InceptionTimeLightning(
-            in_channels=args.in_channels,
-            nb_classes=args.nb_classes,
-            nb_filters=args.nb_filters,
-            use_residual=not args.no_residual,
-            use_bottleneck=not args.no_bottleneck,
-            depth=args.depth,
-            kernel_size=args.kernel_size,
-            bottleneck_size=args.bottleneck_size,
-            lr=args.lr,
-            class_weights=class_weights,
-            sklearn_average=(None if args.average == "none" else args.average),
-        )
-    elif args.model == "Resnet34":
+    if args.model == "Resnet34_hybrib":
         return ResNet1DLightning(
             in_channels=args.in_channels,
             nb_classes=args.nb_classes,
@@ -97,7 +80,7 @@ def load_model(args: argparse.Namespace, class_weights, y_train_np: np.ndarray =
             pos_weight=pw.to(args.device),
         )
     elif args.model == "Resnet34_FocalCos":
-        return ResNet1D_FocalCosAge(
+        return ResNet1D_FocalCos(
             in_channels=args.in_channels,
             nb_classes=args.nb_classes,
             lr=args.lr,
@@ -105,25 +88,6 @@ def load_model(args: argparse.Namespace, class_weights, y_train_np: np.ndarray =
             sklearn_average=(None if args.average == "none" else args.average),
             use_bmi=args.use_bmi,
             use_sex=args.use_sex,
-        )
-    elif args.model == "ConvTimeNet": # Hiện tại chỉ sử dụng RRI (ko HRV, BMI, SEX)
-        return ConvTimeNetLightning(
-            in_channels=args.in_channels,
-            nb_classes=args.nb_classes,
-            lr=args.lr,
-            class_weights=class_weights,
-            sklearn_average=(None if args.average == "none" else args.average),
-            seq_len = args.seq_len,
-        )
-    elif args.model == "ConvTimeNet_coralLoss":
-        pw = coral_pos_weight_from_labels(y_train_np, num_classes=args.nb_classes)
-        return ConvTimeNetCoralLoss(
-            in_channels=args.in_channels,
-            nb_classes=args.nb_classes,
-            lr=args.lr,
-            sklearn_average=(None if args.average == "none" else args.average),
-            seq_len=args.seq_len,
-            pos_weight=pw.to(args.device),
         )
 
     return None
@@ -483,7 +447,7 @@ if __name__ == "__main__":
 
 # dataset-name: AAGING_300s, AAGING_BMI_SEX, tfresh
 # model: InceptionTime, Resnet34, Resnet34_coralLoss,
-#       ConvTimeNet, ConvTimeNet_coralLoss, Resnet34_FocalCosAge
+#       ConvTimeNet, ConvTimeNet_coralLoss, Resnet34_FocalCos
 
 # python run.py `
 #     --root-dir "data/data_300s" `
@@ -492,13 +456,12 @@ if __name__ == "__main__":
 #     --log-dir "result" `
 #     --batch-size 32 `
 #     --max-epochs 2 `
-#     --n-splits 5 `
-#     --use-bmi-sex
-
+#     --n-splits 5
 
 #     --lr 1e-4 `
 #     --use-wandb
 #
+
 # python run.py `
 #     --root-dir "data/data_300s" `
 #     --dataset-name "AAGING_300s" `
