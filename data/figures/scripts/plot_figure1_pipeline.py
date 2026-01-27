@@ -1,18 +1,17 @@
-# plot_figure1_pipeline.py (FINAL FIXED VERSION)
+#!/usr/bin/env python3
+# plot_figure1_pipeline.py (MATCHED + FALLBACK SAFE)
 # ------------------------------------------------------------
-# MỤC TIÊU: Tạo ra các mảnh (Panels) cho Figure 1 chuẩn mực Journal.
+# MỤC TIÊU: Xuất các panel PDF cho Figure 1.
+# YÊU CẦU: Các hàm xử lý phải giống ecg_feature_extractor.py:
+#   - detect_rpeaks: nk.ecg_clean -> nk.ecg_peaks (không correct_artifacts, không fixpeaks)
+#   - compute_rri: diff(rpeaks/fs)
+#   - interpolate_rri: quadratic @4Hz + robust NaN handling
+#   - segment_rri: non-overlap windows (window_sec * 4Hz)
+#   - extract_hrv_features: nk.hrv({"RRI","RRI_Time"}, sampling_rate=fs)
 #
-# QUY TRÌNH XỬ LÝ:
-#   1. Load dữ liệu ECG thô.
-#   2. Chạy pipeline chuẩn trên cửa sổ lớn (ví dụ: 300s) để tính toán chính xác:
-#      - Lọc nhiễu (NeuroKit2 ecg_clean).
-#      - Tìm đỉnh R (R-peaks) + sửa artefact (nếu hỗ trợ).
-#      - Tính chuỗi RRI và nội suy 4Hz.
-#      - Tính bảng chỉ số HRV.
-#   3. Cắt một đoạn ngắn (ví dụ: 20s) từ kết quả trên để VẼ MINH HỌA (Figure 1).
-#      - Chấm đỏ (R-peaks) khớp pixel với sóng ECG (lấy đúng clean_demo[idx]).
-#      - RRI thô + nội suy khớp pha thời gian (cắt theo time mask).
-#   4. FIX layout: legend/figure label nằm NGOÀI vùng biểu đồ (axes) ở Panel C.
+# FIX thực tế cho Figure:
+#   - Nếu record không đủ 300s để tạo segment: fallback sang window ngắn nhất có thể
+#     (vẫn giữ fs_interp=4Hz, kind=quadratic, chỉ thay window hiệu dụng để script không crash).
 # ------------------------------------------------------------
 
 import os
@@ -24,34 +23,118 @@ from scipy.interpolate import interp1d
 import pandas as pd
 from matplotlib.patches import FancyArrowPatch
 
+
 # =============================
-# CONFIG (Cấu hình đường dẫn và thông số)
+# CONFIG
 # =============================
 path_ecg = r"..\..\..\data\raw\0001"
-lead_idx = 1  # Lead II thường là 1, tùy dataset
+
+# Nếu dataset của anh là Lead II ở index=1 thì giữ 1.
+# Nếu record chỉ có 1 channel, code sẽ tự fallback về 0.
+lead_idx = 1
 
 SKIP_SAMPLES = 0
 
+# Tham số phải giống extractor
 hrv_window_sec = 300
 fs_interp = 4.0
+interp_kind = "quadratic"
 
-demo_duration_sec = 5
+# Figure spec: 10s snippet (anh có thể đổi về 5 nếu muốn)
+demo_duration_sec = 10
 demo_start_sec = 0
 
 OUT_DIR = "pdf"
 BASE_FONT = 12
 
-PEAK_METHOD = "neurokit"
-CORRECT_ARTIFACTS = True
-FIXPEAKS_METHOD = "Kubios"
+# Fallback guard: nếu record quá ngắn (HRV không có ý nghĩa), dừng.
+MIN_HRV_SEC = 60  # có thể hạ 30 nếu record quá ngắn, nhưng 60s an toàn hơn
 
 
 # =============================
-# HÀM HỖ TRỢ
+# FUNCTIONS (COPIED FROM extractor)
+# =============================
+
+def detect_rpeaks(raw_ecg, fs):
+    ecg_clean = nk.ecg_clean(raw_ecg, sampling_rate=fs)
+    peaks, info = nk.ecg_peaks(ecg_clean, sampling_rate=fs)
+    return info["ECG_R_Peaks"]
+
+
+def compute_rri(rpeaks, fs):
+    times = np.array(rpeaks) / fs
+    rri = np.diff(times)
+    times_rri = times[1:]
+    return times_rri, rri
+
+
+def interpolate_rri(times_rri, rri, fs_interp=4.0, kind="quadratic"):
+    times_rri = np.asarray(times_rri, dtype=float)
+    rri = np.asarray(rri, dtype=float)
+
+    # bỏ NaN/inf trước khi nội suy
+    m = np.isfinite(times_rri) & np.isfinite(rri)
+    times_rri = times_rri[m]
+    rri = rri[m]
+
+    if times_rri.size < 2:
+        return np.array([]), np.array([])
+
+    # Lưới thời gian đều
+    t_interp = np.arange(times_rri[0], times_rri[-1] + 1e-12, 1.0 / fs_interp)
+
+    # Nội suy "an toàn": không lỗi biên, điền bằng ngoại suy tuyến tính
+    f = interp1d(
+        times_rri, rri,
+        kind=kind,
+        bounds_error=False,
+        fill_value="extrapolate",
+        assume_sorted=True,
+    )
+    y = f(t_interp)
+
+    # Nếu còn NaN hiếm, điền tuyến tính ngắn
+    if np.any(~np.isfinite(y)):
+        good = np.isfinite(y)
+        if good.any():
+            y[~good] = np.interp(np.flatnonzero(~good), np.flatnonzero(good), y[good])
+        else:
+            return np.array([]), np.array([])
+
+    return t_interp, y
+
+
+def segment_rri(t_interp, rri_interp, fs_interp=4.0, window_sec=300):
+    window_size = int(window_sec * fs_interp)
+    segments = []
+    for start in range(0, len(rri_interp) - window_size + 1, window_size):
+        segments.append(rri_interp[start:start + window_size])
+    return segments
+
+
+def extract_hrv_features(rri_segments, fs):
+    rows = []
+    for rri in rri_segments:
+        time = np.linspace(0, len(rri)/4.0, len(rri))
+        hrv_all = nk.hrv({"RRI": rri*1000, "RRI_Time": time}, sampling_rate=fs, show=False)
+        rows.append(hrv_all.iloc[0].to_dict())
+
+    df = pd.DataFrame(rows)
+    cols = [
+        "HRV_MeanNN", "HRV_SDNN", "HRV_RMSSD", "HRV_pNN50", "HRV_HTI", "HRV_TINN",
+        "HRV_VLF", "HRV_LF", "HRV_LFn", "HRV_HF", "HRV_HFn", "HRV_LFHF", "HRV_TP",
+        "HRV_ApEn", "HRV_SampEn", "HRV_DFA_alpha1", "HRV_DFA_alpha2", "HRV_CD",
+        "HRV_SD1", "HRV_SD2"
+    ]
+    df20 = df[cols]
+    return df20
+
+
+# =============================
+# PLOT HELPERS
 # =============================
 
 def set_plot_style(base_font: int = 12):
-    """Thiết lập style cho Matplotlib để hình ảnh sắc nét và chuẩn font."""
     plt.rcParams.update({
         "figure.dpi": 150,
         "savefig.dpi": 300,
@@ -69,7 +152,6 @@ def set_plot_style(base_font: int = 12):
 
 
 def save_pdf(fig, filepath: str, extra_artists=None):
-    """Lưu figure ra file PDF với lề gọn gàng (hỗ trợ legend nằm ngoài axes)."""
     kwargs = {}
     if extra_artists:
         kwargs["bbox_extra_artists"] = extra_artists
@@ -78,45 +160,7 @@ def save_pdf(fig, filepath: str, extra_artists=None):
     print(f"✓ Saved {filepath}")
 
 
-def detect_rpeaks_robust(ecg_clean: np.ndarray, fs: float) -> np.ndarray:
-    """Phát hiện đỉnh R có sửa lỗi (Artifact Correction), tương thích nhiều phiên bản NeuroKit2."""
-    if CORRECT_ARTIFACTS:
-        try:
-            _, info = nk.ecg_peaks(
-                ecg_clean,
-                sampling_rate=fs,
-                method=PEAK_METHOD,
-                correct_artifacts=True
-            )
-            return np.array(info["ECG_R_Peaks"], dtype=int)
-        except TypeError:
-            # Phiên bản cũ không hỗ trợ correct_artifacts
-            pass
-
-    _, info = nk.ecg_peaks(ecg_clean, sampling_rate=fs, method=PEAK_METHOD)
-    rpeaks = np.array(info.get("ECG_R_Peaks", []), dtype=int)
-
-    if CORRECT_ARTIFACTS and len(rpeaks) > 0:
-        try:
-            fixed_peaks = nk.signal_fixpeaks(
-                rpeaks,
-                sampling_rate=fs,
-                method=FIXPEAKS_METHOD,
-                show=False
-            )
-            if isinstance(fixed_peaks, tuple):
-                fixed_peaks = fixed_peaks[0]
-            if isinstance(fixed_peaks, dict):
-                fixed_peaks = fixed_peaks.get("Peaks", fixed_peaks.get("ECG_R_Peaks"))
-            return np.array(fixed_peaks, dtype=int)
-        except Exception as e:
-            print(f"[Warn] Fixpeaks failed ({e}), using raw peaks.")
-
-    return rpeaks
-
-
 def debug_checks(demo_signal, demo_peaks_indices, demo_peak_times, demo_peak_values, fs, stage_name="Demo Slice"):
-    """In báo cáo kiểm tra logic dữ liệu (alignment, bounds, time axis)."""
     print(f"\n🔍 --- DEBUG REPORT: {stage_name} ---")
 
     n_samples = len(demo_signal)
@@ -132,42 +176,38 @@ def debug_checks(demo_signal, demo_peaks_indices, demo_peak_times, demo_peak_val
     max_idx = int(np.max(demo_peaks_indices))
 
     if min_idx < 0 or max_idx >= n_samples:
-        print(f"   ❌ [FAIL] Index lỗi! Peak index nằm ngoài phạm vi tín hiệu [0, {n_samples-1}].")
+        print(f"   ❌ [FAIL] Peak index out of bounds [0, {n_samples-1}]")
         print(f"      Min peak: {min_idx}, Max peak: {max_idx}")
     else:
-        print("   ✅ [PASS] Bounds check: Tất cả đỉnh nằm gọn trong cửa sổ.")
+        print("   ✅ [PASS] Bounds check: Peaks within window.")
 
     signal_values_at_peaks = demo_signal[demo_peaks_indices]
     diff = np.abs(signal_values_at_peaks - demo_peak_values)
     max_diff = float(np.max(diff))
 
     if max_diff > 1e-6:
-        print("   ❌ [FAIL] LỆCH ĐỈNH! Chấm đỏ không nằm trên đường xanh.")
-        print(f"      Sai số lớn nhất: {max_diff:.6f}")
+        print("   ❌ [FAIL] Peak alignment mismatch (scatter not on curve).")
+        print(f"      Max abs diff: {max_diff:.6f}")
     else:
-        print("   ✅ [PASS] Alignment check: Chấm đỏ khớp 100% với dây tín hiệu.")
+        print("   ✅ [PASS] Alignment check: scatter matches curve.")
 
     calculated_times = demo_peaks_indices / fs
     time_diff = np.abs(calculated_times - demo_peak_times)
     if float(np.max(time_diff)) > 1e-6:
-        print("   ❌ [FAIL] Lỗi trục thời gian (Time Axis).")
+        print("   ❌ [FAIL] Time axis mismatch.")
     else:
-        print("   ✅ [PASS] Time axis check: Trục thời gian chuẩn.")
-
+        print("   ✅ [PASS] Time axis OK.")
     print("--------------------------------------------------\n")
 
 
 # =============================
-# CHƯƠNG TRÌNH CHÍNH
+# MAIN
 # =============================
 
 def main():
     os.makedirs(OUT_DIR, exist_ok=True)
     set_plot_style(BASE_FONT)
 
-    # -----------------------------
-    # BƯỚC 1: LOAD DỮ LI LIỆU GỐC
-    # -----------------------------
     print(f"Loading record: {path_ecg} (Lead index: {lead_idx})")
     try:
         record = wfdb.rdrecord(path_ecg)
@@ -182,69 +222,69 @@ def main():
 
     n_ch = record.p_signal.shape[1]
     if lead_idx < 0 or lead_idx >= n_ch:
-        raise ValueError(f"lead_idx={lead_idx} out of range. Record has {n_ch} channel(s).")
+        print(f"[Warn] lead_idx={lead_idx} out of range (record has {n_ch} channel). Fallback lead_idx=0.")
+        use_lead = 0
+    else:
+        use_lead = lead_idx
 
-    raw_ecg_full = record.p_signal[:, lead_idx]
-
-    if hasattr(record, "sig_name") and record.sig_name is not None and len(record.sig_name) > lead_idx:
-        print(f"[Info] sig_name[{lead_idx}] = {record.sig_name[lead_idx]}")
+    raw_ecg_full = record.p_signal[:, use_lead]
 
     if SKIP_SAMPLES > 0:
         if SKIP_SAMPLES >= len(raw_ecg_full):
             raise RuntimeError(f"SKIP_SAMPLES={SKIP_SAMPLES} >= signal length {len(raw_ecg_full)}.")
         raw_ecg_full = raw_ecg_full[SKIP_SAMPLES:]
 
-    # -----------------------------
-    # BƯỚC 2: CHẠY PIPELINE CHÍNH (TRÊN CỬA SỔ LỚN)
-    # -----------------------------
-    n_hrv = int(hrv_window_sec * fs)
-    if len(raw_ecg_full) >= n_hrv:
-        raw_main = raw_ecg_full[:n_hrv]
+    # Main window = 300s nếu đủ, else full record (giống logic an toàn của figure)
+    n_main = int(hrv_window_sec * fs)
+    if len(raw_ecg_full) >= n_main:
+        raw_main = raw_ecg_full[:n_main]
     else:
         raw_main = raw_ecg_full
         print(f"[Warn] Record shorter than {hrv_window_sec}s. Using full length ({len(raw_main)/fs:.1f}s).")
 
+    # ---- Pipeline giống extractor ----
+    # Peaks
+    rpeaks_main = np.array(detect_rpeaks(raw_main, fs), dtype=int)
+
+    # Clean for plotting (cùng thao tác với detect_rpeaks)
     ecg_clean_main = nk.ecg_clean(raw_main, sampling_rate=fs)
-    rpeaks_main = detect_rpeaks_robust(ecg_clean_main, fs)
 
     if len(rpeaks_main) < 10:
         raise RuntimeError(f"Too few R-peaks detected in main window: {len(rpeaks_main)}.")
 
-    times_r_main = rpeaks_main / fs
-    rri_main = np.diff(times_r_main)
-    times_rri_main = times_r_main[1:]
+    # RRI raw
+    times_rri_main, rri_main = compute_rri(rpeaks_main, fs)
 
-    # Nội suy RRI sang 4Hz
-    if len(times_rri_main) < 3:
-        raise RuntimeError("Not enough RR intervals for interpolation/HRV.")
+    # Interp 4Hz
+    t_interp_main, rri_interp_main = interpolate_rri(times_rri_main, rri_main, fs_interp=fs_interp, kind=interp_kind)
+    if t_interp_main.size == 0 or rri_interp_main.size == 0:
+        raise RuntimeError("Interpolation returned empty result (not enough valid RR intervals).")
 
-    t_interp_main = np.arange(times_rri_main[0], times_rri_main[-1], 1.0 / fs_interp)
+    # Segment 300s (extractor style)
+    rri_segs = segment_rri(t_interp_main, rri_interp_main, fs_interp=fs_interp, window_sec=hrv_window_sec)
 
-    f_interp = interp1d(
-        times_rri_main,
-        rri_main,
-        kind="quadratic",
-        fill_value="extrapolate",
-        bounds_error=False,
-        assume_sorted=True
-    )
-    rri_interp_main = f_interp(t_interp_main)
+    # ✅ FIX: fallback nếu không đủ 300s để tạo segment
+    if len(rri_segs) == 0:
+        available_sec = float(len(rri_interp_main) / fs_interp)
+        eff_sec = int(np.floor(available_sec))
+        print(f"[Warn] Not enough interpolated RRI length for 300s@4Hz (need 1200 samples). "
+              f"Available ≈ {available_sec:.1f}s.")
 
-    # HRV
-    rri_time_for_hrv = (t_interp_main - t_interp_main[0]).astype(float)
-    try:
-        hrv_results = nk.hrv(
-            {"RRI": rri_interp_main * 1000.0, "RRI_Time": rri_time_for_hrv},
-            sampling_rate=fs_interp,
-            show=False
-        )
-    except Exception as e:
-        print(f"❌ Error computing HRV: {e}")
-        return
+        if eff_sec < MIN_HRV_SEC:
+            raise RuntimeError(
+                f"Record too short for HRV fallback: only ~{available_sec:.1f}s interpolated RRI. "
+                f"Need at least {MIN_HRV_SEC}s."
+            )
 
-    # -----------------------------
-    # BƯỚC 3: CẮT ĐOẠN DEMO ĐỂ VẼ (DEMO SNIPPET)
-    # -----------------------------
+        # tạo 1 segment fallback (vẫn dùng đúng RRI nội suy 4Hz và nk.hrv như extractor)
+        eff_len = int(eff_sec * fs_interp)
+        rri_segs = [rri_interp_main[:eff_len]]
+        print(f"[Warn] Using HRV fallback window: {eff_sec}s (segment length={eff_len} samples).")
+
+    # HRV features (extractor style)
+    hrv_df20 = extract_hrv_features(rri_segs, fs=fs)
+
+    # ---- Demo snippet (10s) for plots ----
     start_idx = int(demo_start_sec * fs)
     n_demo = int(demo_duration_sec * fs)
     end_idx = start_idx + n_demo
@@ -256,26 +296,24 @@ def main():
 
     raw_demo = raw_main[start_idx:end_idx]
     clean_demo = ecg_clean_main[start_idx:end_idx]
-    t_demo = np.arange(len(clean_demo)) / fs  # 0 -> demo_duration
+    t_demo = np.arange(len(clean_demo)) / fs
 
-    # Peaks within demo (index-based để khớp pixel)
+    # Peaks in demo (pixel-aligned)
     mask_peaks = (rpeaks_main >= start_idx) & (rpeaks_main < end_idx)
     rpeaks_demo_indices = (rpeaks_main[mask_peaks] - start_idx).astype(int)
-
-    # (x, y) cho scatter
     peak_times_demo = rpeaks_demo_indices / fs
-    peak_values_demo = clean_demo[rpeaks_demo_indices]
+    peak_values_demo = clean_demo[rpeaks_demo_indices] if len(rpeaks_demo_indices) > 0 else np.array([])
 
     debug_checks(
         demo_signal=clean_demo,
         demo_peaks_indices=rpeaks_demo_indices,
         demo_peak_times=peak_times_demo,
-        demo_peak_values=peak_values_demo,
+        demo_peak_values=peak_values_demo if len(peak_values_demo) > 0 else np.array([]),
         fs=fs,
         stage_name="Panel C Visualization"
     )
 
-    # RRI cắt theo thời gian demo (giây tuyệt đối của cửa sổ main)
+    # RRI cut for demo (absolute sec in main window)
     demo_start_t = start_idx / fs
     demo_end_t = end_idx / fs
 
@@ -289,11 +327,11 @@ def main():
 
     x_max = len(clean_demo) / fs
 
-    # -----------------------------
-    # BƯỚC 4: VẼ VÀ XUẤT FILE PDF (PANELS)
-    # -----------------------------
+    # =============================
+    # EXPORT PANELS
+    # =============================
 
-    # --- PANEL A: RAW INPUT ---
+    # Panel A
     figA, axA = plt.subplots(figsize=(6, 2.1))
     axA.plot(t_demo, raw_demo, color="#555555", linewidth=0.9)
     axA.set_xlim(0, x_max)
@@ -303,7 +341,7 @@ def main():
     axA.grid(True)
     save_pdf(figA, os.path.join(OUT_DIR, "panel_A_raw.pdf"))
 
-    # --- PANEL B: FILTERING ---
+    # Panel B
     figB, axB = plt.subplots(figsize=(6, 2.1))
     axB.plot(t_demo, clean_demo, color="#1f77b4", linewidth=0.9)
     axB.set_xlim(0, x_max)
@@ -313,22 +351,21 @@ def main():
     axB.grid(True)
     save_pdf(figB, os.path.join(OUT_DIR, "panel_B_clean.pdf"))
 
-    # --- PANEL C: FEATURE EXTRACTION (2 Subplots) ---
+    # Panel C
     figC, (ax1, ax2) = plt.subplots(
         2, 1,
         figsize=(6, 4.4),
         gridspec_kw={"height_ratios": [1, 1], "hspace": 0.35}
     )
 
-    # Subplot C1: R-peak Detection
     ax1.plot(t_demo, clean_demo, color="#1f77b4", linewidth=0.9)
-    ax1.scatter(peak_times_demo, peak_values_demo, color="red", s=25, zorder=5, label="R-peaks")
+    if len(peak_times_demo) > 0:
+        ax1.scatter(peak_times_demo, peak_values_demo, color="red", s=25, zorder=5, label="R-peaks")
     ax1.set_xlim(0, x_max)
     ax1.set_ylabel("Voltage (mV)")
     ax1.set_title("R-peak Detection")
     ax1.grid(True)
 
-    # Subplot C2: RRI Time Series
     ax2.step(t_rri_demo, val_rri_demo, where="pre", color="gray", alpha=0.6, label="Raw RRI", linewidth=1.2)
     ax2.plot(t_int_demo, val_int_demo, color="#d62728", linewidth=1.5, label="4 Hz Interpolated")
     ax2.set_xlim(0, x_max)
@@ -336,8 +373,7 @@ def main():
     ax2.set_xlabel("Time (s)")
     ax2.grid(True)
 
-    # ✅ Legend ngoài vùng axes (margin phải) - 1 legend chung cho cả figure
-    figC.subplots_adjust(right=0.78)  # chừa lề phải
+    figC.subplots_adjust(right=0.78)
     h1, l1 = ax1.get_legend_handles_labels()
     h2, l2 = ax2.get_legend_handles_labels()
     leg = figC.legend(
@@ -349,7 +385,6 @@ def main():
         fontsize=10
     )
 
-    # Mũi tên nối giữa 2 subplot
     p1 = ax1.get_position()
     p2 = ax2.get_position()
     arrow_x = (p1.x0 + p1.x1) / 2
@@ -362,51 +397,46 @@ def main():
 
     save_pdf(figC, os.path.join(OUT_DIR, "panel_C_features.pdf"), extra_artists=[leg])
 
-    # --- PANEL HRV TABLE ---
+    # Panel HRV table (from extractor-style HRV df20, first segment)
     cols_wanted = ["HRV_SDNN", "HRV_RMSSD", "HRV_pNN50", "HRV_MeanNN", "HRV_LFHF"]
-    available_cols = [c for c in cols_wanted if c in hrv_results.columns]
+    row0 = hrv_df20.iloc[0]
 
-    if available_cols:
-        row_hrv = hrv_results.iloc[0][available_cols]
-
-        table_data = []
-        for col in cols_wanted:
-            if col in row_hrv:
-                val = row_hrv[col]
-                key_nice = col.replace("HRV_", "")
-                if key_nice in ["SDNN", "RMSSD", "MeanNN"]:
-                    val_str = f"{float(val):.1f}"
-                elif key_nice == "pNN50":
-                    val_str = f"{float(val):.1f}"
-                else:
-                    val_str = f"{float(val):.2f}"
-                table_data.append([key_nice, val_str])
+    table_data = []
+    for col in cols_wanted:
+        if col in row0.index and pd.notna(row0[col]):
+            val = float(row0[col])
+            key_nice = col.replace("HRV_", "")
+            if key_nice in ["SDNN", "RMSSD", "MeanNN"]:
+                val_str = f"{val:.1f}"
+            elif key_nice == "pNN50":
+                val_str = f"{val:.1f}"
             else:
-                table_data.append([col.replace("HRV_", ""), "-"])
+                val_str = f"{val:.2f}"
+            table_data.append([key_nice, val_str])
+        else:
+            table_data.append([col.replace("HRV_", ""), "-"])
 
-        df_tbl = pd.DataFrame(table_data, columns=["Feature", "Value"])
+    df_tbl = pd.DataFrame(table_data, columns=["Feature", "Value"])
 
-        figT, axT = plt.subplots(figsize=(3.5, 2.2))
-        axT.axis("off")
-        table = axT.table(
-            cellText=df_tbl.values,
-            colLabels=df_tbl.columns,
-            loc="center",
-            cellLoc="center",
-            colWidths=[0.5, 0.4]
-        )
-        table.auto_set_font_size(False)
-        table.set_fontsize(11)
-        table.scale(1.0, 1.4)
+    figT, axT = plt.subplots(figsize=(3.5, 2.2))
+    axT.axis("off")
+    table = axT.table(
+        cellText=df_tbl.values,
+        colLabels=df_tbl.columns,
+        loc="center",
+        cellLoc="center",
+        colWidths=[0.5, 0.4]
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(11)
+    table.scale(1.0, 1.4)
 
-        for (r, c), cell in table.get_celld().items():
-            if r == 0:
-                cell.set_text_props(weight="bold")
-                cell.set_facecolor("#f0f0f0")
+    for (r, c), cell in table.get_celld().items():
+        if r == 0:
+            cell.set_text_props(weight="bold")
+            cell.set_facecolor("#f0f0f0")
 
-        save_pdf(figT, os.path.join(OUT_DIR, "panel_C_hrv_table.pdf"))
-    else:
-        print("⚠️ Warning: No HRV features computed to generate table.")
+    save_pdf(figT, os.path.join(OUT_DIR, "panel_C_hrv_table.pdf"))
 
     print("\n✅ DONE! All PDF panels saved in 'pdf/' folder.")
 
